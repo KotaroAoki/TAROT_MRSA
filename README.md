@@ -1,6 +1,6 @@
-# Tracking Antimicrobial Resistance Organisms Timely (TAROT) for methicillin-resistance *Staphylococcus aureus* (TAROT-MRSA)
+# Tracking Antimicrobial Resistant Organisms Timely (TAROT) for methicillin-resistant *Staphylococcus aureus* (TAROT-MRSA)
 
-![Tracking Antimicrobial Resistant Organisms Timely_v3_trimed](https://github.com/user-attachments/assets/91b94402-258c-43ce-a836-eae9e4ce1fee)
+![Tracking Antimicrobial Resistant Organisms Timely](TAROT_logo.jpg)
 
 
 # About TAROT
