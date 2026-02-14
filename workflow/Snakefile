@@ -1,0 +1,668 @@
+"""
+TAROT-MRSA: Snakemake workflow for successive cgSNP-based phylogenetic analysis
+of methicillin-resistant Staphylococcus aureus (MRSA).
+
+Converted from TAROT_MRSA_successive_cgSNP_analysis.sh
+"""
+
+import os
+import glob
+
+# ── Load configuration ──────────────────────────────────────────────────────
+configfile: "config/config.yaml"
+
+SAMPLES      = config["samples"]
+SAMPLE_DIR   = config["sample_dir"]
+REFERENCE_DIR = config["reference_dir"]
+BAM_DIR      = config["bam_dir"]
+TOOLS_PATH   = config["tools_path"]
+STRINGMLST_DB = config["stringmlst_db"]
+GENOME_SIZE  = config["genome_size"]
+COVERAGE     = config["coverage"]
+THREADS      = config["threads"]
+MIN_STRAINS  = config["min_strains_for_snp"]
+
+SCRIPTS_DIR  = os.path.join(workflow.basedir, "scripts")
+
+
+# ── Utility functions ────────────────────────────────────────────────────────
+def get_fastq_patterns(wildcards):
+    """Return all .fastq and .fastq.gz files for a sample."""
+    d = os.path.join(SAMPLE_DIR, wildcards.sample)
+    files = (
+        glob.glob(os.path.join(d, "*.fastq"))
+        + glob.glob(os.path.join(d, "*.fastq.gz"))
+        + glob.glob(os.path.join(d, "*.fq"))
+        + glob.glob(os.path.join(d, "*.fq.gz"))
+    )
+    return sorted(files)
+
+
+def read_bestref(sample):
+    """Read the best reference name from bestref.txt."""
+    path = f"results/{sample}/bestref.txt"
+    if os.path.exists(path):
+        with open(path) as f:
+            return f.readline().strip().split("\t")[0]
+    return "UNKNOWN"
+
+
+def read_match_method(sample):
+    """Read the matching method (mlst or bbmap) from bestref.txt."""
+    path = f"results/{sample}/bestref.txt"
+    if os.path.exists(path):
+        with open(path) as f:
+            parts = f.readline().strip().split("\t")
+            return parts[1] if len(parts) > 1 else "mlst"
+    return "mlst"
+
+
+# ── Target rule ──────────────────────────────────────────────────────────────
+rule all:
+    input:
+        expand("results/{sample}/sorted.bam", sample=SAMPLES),
+        expand("results/{sample}/sorted.bam.bai", sample=SAMPLES),
+        expand("results/{sample}/nanoplot_raw/NanoStats.txt", sample=SAMPLES),
+        expand("results/{sample}/nanoplot_trimmed/NanoStats.txt", sample=SAMPLES),
+        expand("results/{sample}/stringMLST.txt", sample=SAMPLES),
+        expand("results/{sample}/bestref.txt", sample=SAMPLES),
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Per-sample processing rules
+# ══════════════════════════════════════════════════════════════════════════════
+
+rule decompress:
+    """Decompress gzipped FASTQ files."""
+    input:
+        sample_dir=os.path.join(SAMPLE_DIR, "{sample}"),
+    output:
+        flag=touch("results/{sample}/.decompressed"),
+    shell:
+        """
+        cd {input.sample_dir}
+        if ls *.gz 1>/dev/null 2>&1; then
+            unpigz -f *.gz
+        fi
+        """
+
+
+rule concat_reads:
+    """Concatenate all FASTQ files for a sample."""
+    input:
+        sample_dir=os.path.join(SAMPLE_DIR, "{sample}"),
+        flag="results/{sample}/.decompressed",
+    output:
+        fastq="results/{sample}/cat_reads.fastq",
+    shell:
+        """
+        cat {input.sample_dir}/*.fastq > {output.fastq} 2>/dev/null || \
+        cat {input.sample_dir}/*.fq > {output.fastq} 2>/dev/null || \
+        echo "No FASTQ files found" >&2
+        """
+
+
+rule nanoplot_raw:
+    """QC of raw reads using NanoPlot."""
+    input:
+        fastq="results/{sample}/cat_reads.fastq",
+    output:
+        stats="results/{sample}/nanoplot_raw/NanoStats.txt",
+    params:
+        outdir="results/{sample}/nanoplot_raw",
+    threads: THREADS
+    shell:
+        """
+        NanoPlot --fastq {input.fastq} --loglength -o {params.outdir}
+        """
+
+
+rule nanofilt:
+    """Filter reads by quality and length using NanoFilt."""
+    input:
+        fastq="results/{sample}/cat_reads.fastq",
+    output:
+        trimmed="results/{sample}/trimmed.fastq",
+    params:
+        quality=config["nanofilt"]["quality"],
+        headcrop=config["nanofilt"]["headcrop"],
+        min_length=config["nanofilt"]["min_length"],
+    shell:
+        """
+        NanoFilt -q {params.quality} --headcrop {params.headcrop} \
+            -l {params.min_length} < {input.fastq} > {output.trimmed}
+        """
+
+
+rule nanoplot_trimmed:
+    """QC of trimmed reads using NanoPlot."""
+    input:
+        fastq="results/{sample}/trimmed.fastq",
+    output:
+        stats="results/{sample}/nanoplot_trimmed/NanoStats.txt",
+    params:
+        outdir="results/{sample}/nanoplot_trimmed",
+    threads: THREADS
+    shell:
+        """
+        NanoPlot --fastq {input.fastq} --loglength -o {params.outdir}
+        """
+
+
+rule downsample:
+    """Downsample reads to target coverage depth."""
+    input:
+        fastq="results/{sample}/trimmed.fastq",
+        stats="results/{sample}/nanoplot_trimmed/NanoStats.txt",
+    output:
+        downsampled="results/{sample}/downsampled.fastq",
+    params:
+        genome_size=GENOME_SIZE,
+        coverage=COVERAGE,
+    shell:
+        r"""
+        total_bases=$(grep "Total bases" {input.stats} | \
+            awk -F":" '{{print $2}}' | perl -pe 's/ |,//g')
+        target=$(($(({params.genome_size})) * $(({params.coverage}))))
+        rate=$(echo "scale=5; $target / $total_bases" | bc)
+
+        if (( $(echo "$rate >= 0 && $rate < 1" | bc -l) )); then
+            seqkit sample -p $rate {input.fastq} > {output.downsampled}
+        else
+            cp {input.fastq} {output.downsampled}
+        fi
+        """
+
+
+rule dechat:
+    """Self-error correction of long reads using dechat."""
+    input:
+        fastq="results/{sample}/downsampled.fastq",
+    output:
+        corrected="results/{sample}/dechat.ec.fa",
+    params:
+        prefix="results/{sample}/dechat",
+    threads: 20
+    shell:
+        """
+        dechat -i {input.fastq} -o {params.prefix} -t {threads}
+        """
+
+
+rule wgsim:
+    """Convert corrected reads to paired-end short reads using wgsim."""
+    input:
+        fasta="results/{sample}/dechat.ec.fa",
+    output:
+        r1="results/{sample}/R1.fastq",
+        r2="results/{sample}/R2.fastq",
+    params:
+        read_length=config["wgsim"]["read_length"],
+        num_reads=config["wgsim"]["num_reads"],
+    shell:
+        """
+        wgsim -h -1 {params.read_length} -2 {params.read_length} \
+            -N{params.num_reads} -e0 -r0 -R0 -X0 -d0 \
+            {input.fasta} {output.r1} {output.r2}
+        """
+
+
+rule stringmlst:
+    """Determine MLST type using stringMLST."""
+    input:
+        r1="results/{sample}/R1.fastq",
+        r2="results/{sample}/R2.fastq",
+    output:
+        mlst="results/{sample}/stringMLST.txt",
+    params:
+        db=STRINGMLST_DB,
+    shell:
+        """
+        stringMLST.py --predict -P {params.db} \
+            -1 {input.r1} -2 {input.r2} \
+            -o {output.mlst}
+        """
+
+
+rule find_best_reference:
+    """
+    Find the best reference genome for mapping.
+    Uses MLST-based matching first; falls back to bbsplit if no match.
+    Outputs bestref.txt with format: <reference_name>\t<method>
+    """
+    input:
+        mlst="results/{sample}/stringMLST.txt",
+        r1="results/{sample}/R1.fastq",
+        r2="results/{sample}/R2.fastq",
+    output:
+        bestref="results/{sample}/bestref.txt",
+    params:
+        reference_dir=REFERENCE_DIR,
+    shell:
+        r"""
+        # Parse MLST type
+        MLST=$(awk 'NR>1 {{gsub(/\*/, "", $1); print $9}}' {input.mlst})
+
+        # Check if reference exists for this ST
+        db_STs=$(ls {params.reference_dir}/*.fasta 2>/dev/null | \
+            xargs -I{{}} basename {{}} .fasta | sort | uniq)
+
+        found=0
+        for db_ST in $db_STs; do
+            if [[ "$db_ST" == "ST$MLST" ]]; then
+                found=1
+                break
+            fi
+        done
+
+        if [[ $found -eq 1 ]]; then
+            echo -e "ST$MLST\tmlst" > {output.bestref}
+        else
+            # Use bbsplit to find the best reference
+            reference_genome=$(find {params.reference_dir} -maxdepth 1 \
+                -type f -name "*.fasta" ! -name ".*" | tr '\n' ',' | sed 's/,$//')
+            bbsplit.sh -Xmx20g ref=$reference_genome \
+                in1={input.r1} in2={input.r2} \
+                outu1=results/{wildcards.sample}/clean1.fq.gz \
+                outu2=results/{wildcards.sample}/clean2.fq.gz \
+                refstats=results/{wildcards.sample}/refstats.out \
+                basename=results/{wildcards.sample}/out_%.fq.gz
+            bestref=$(awk 'NR==1 {{max=$2; max_line=$0}} $2>max {{max=$2; max_line=$0}} END{{print max_line}}' \
+                results/{wildcards.sample}/refstats.out | awk '{{print $1}}')
+            echo -e "$bestref\tbbmap" > {output.bestref}
+        fi
+        """
+
+
+rule bwa_mapping:
+    """Map reads to the best reference genome using BWA."""
+    input:
+        r1="results/{sample}/R1.fastq",
+        r2="results/{sample}/R2.fastq",
+        bestref="results/{sample}/bestref.txt",
+    output:
+        bam="results/{sample}/sorted.bam",
+        bai="results/{sample}/sorted.bam.bai",
+    params:
+        reference_dir=REFERENCE_DIR,
+    threads: THREADS
+    shell:
+        r"""
+        bestref=$(cut -f1 {input.bestref})
+        method=$(cut -f2 {input.bestref})
+
+        # Determine reference FASTA path
+        if [[ "$method" == "bbmap" ]]; then
+            ref_fasta="{params.reference_dir}/${{bestref}}_bbsplit.fasta"
+            if [[ ! -f "$ref_fasta" ]]; then
+                ref_fasta="{params.reference_dir}/${{bestref}}.fasta"
+            fi
+        else
+            ref_fasta="{params.reference_dir}/${{bestref}}.fasta"
+        fi
+
+        # Combine R1 and R2
+        cat {input.r1} {input.r2} > results/{wildcards.sample}/R12.fastq
+
+        # BWA index and map
+        bwa index "$ref_fasta"
+        bwa bwasw -t {threads} "$ref_fasta" \
+            results/{wildcards.sample}/R12.fastq > results/{wildcards.sample}/out12.sam
+
+        # Convert and sort
+        samtools view -@ {threads} -S -b \
+            results/{wildcards.sample}/out12.sam > results/{wildcards.sample}/out12.bam
+        samtools sort -@ {threads} \
+            results/{wildcards.sample}/out12.bam -o {output.bam}
+        samtools index {output.bam}
+
+        # Clean up
+        rm -f results/{wildcards.sample}/out12.sam \
+              results/{wildcards.sample}/out12.bam \
+              results/{wildcards.sample}/R12.fastq
+        """
+
+
+rule store_bam:
+    """Copy sorted BAM to the reference-organized BAM directory."""
+    input:
+        bam="results/{sample}/sorted.bam",
+        bai="results/{sample}/sorted.bam.bai",
+        bestref="results/{sample}/bestref.txt",
+    output:
+        flag=touch("results/{sample}/.bam_stored"),
+    params:
+        bam_dir=BAM_DIR,
+    shell:
+        r"""
+        bestref=$(cut -f1 {input.bestref})
+        method=$(cut -f2 {input.bestref})
+
+        if [[ "$method" == "bbmap" ]]; then
+            target_dir="{params.bam_dir}/${{bestref}}_bbsplit"
+        else
+            target_dir="{params.bam_dir}/${{bestref}}"
+        fi
+
+        mkdir -p "$target_dir"
+        cp {input.bam} "$target_dir/{wildcards.sample}_${{bestref}}_out12.sorted.bam"
+        cp {input.bai} "$target_dir/{wildcards.sample}_${{bestref}}_out12.sorted.bam.bai"
+        """
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  cgSNP analysis rules (run after all per-sample processing)
+# ══════════════════════════════════════════════════════════════════════════════
+
+rule collect_bams:
+    """
+    Collect BAM files per reference type and create bam_list and name_list
+    for cgSNP analysis.
+    """
+    input:
+        flags=expand("results/{sample}/.bam_stored", sample=SAMPLES),
+        bestrefs=expand("results/{sample}/bestref.txt", sample=SAMPLES),
+    output:
+        bam_list="results/cgsnp/bam_list.txt",
+        name_list="results/cgsnp/name_list.txt",
+        ref_info="results/cgsnp/ref_info.txt",
+    params:
+        bam_dir=BAM_DIR,
+    run:
+        # Group samples by reference
+        from collections import defaultdict
+        ref_groups = defaultdict(list)
+
+        for sample in SAMPLES:
+            bestref_file = f"results/{sample}/bestref.txt"
+            with open(bestref_file) as f:
+                parts = f.readline().strip().split("\t")
+                ref_name = parts[0]
+                method = parts[1] if len(parts) > 1 else "mlst"
+            ref_groups[(ref_name, method)].append(sample)
+
+        # Use the largest group (or the first one)
+        best_group = max(ref_groups.items(), key=lambda x: len(x[1]))
+        (ref_name, method), group_samples = best_group
+
+        if method == "bbmap":
+            bam_subdir = f"{ref_name}_bbsplit"
+        else:
+            bam_subdir = ref_name
+
+        bam_dir_path = os.path.join(params.bam_dir, bam_subdir)
+
+        # Write bam_list
+        bam_files = sorted(
+            glob.glob(os.path.join(bam_dir_path, "*sorted.bam"))
+        )
+        with open(output.bam_list, "w") as f:
+            for bam in bam_files:
+                f.write(bam + "\n")
+
+        # Write name_list
+        with open(output.name_list, "w") as f:
+            for bam in bam_files:
+                name = os.path.basename(bam).replace(".sorted.bam", "").replace("_out12", "")
+                sample_id = name.split("_")[0]
+                f.write(f">{sample_id}\n")
+
+        # Write ref info
+        with open(output.ref_info, "w") as f:
+            f.write(f"{ref_name}\t{method}\n")
+
+
+rule mpileup_varscan:
+    """Run samtools mpileup and VarScan consensus calling."""
+    input:
+        bam_list="results/cgsnp/bam_list.txt",
+        ref_info="results/cgsnp/ref_info.txt",
+    output:
+        cns="results/cgsnp/mpileup2cns.txt",
+    params:
+        reference_dir=REFERENCE_DIR,
+        tools_path=TOOLS_PATH,
+    shell:
+        r"""
+        ref_name=$(cut -f1 {input.ref_info})
+        method=$(cut -f2 {input.ref_info})
+
+        if [[ "$method" == "bbmap" ]]; then
+            ref_fasta="{params.reference_dir}/${{ref_name}}_bbsplit.fasta"
+            if [[ ! -f "$ref_fasta" ]]; then
+                ref_fasta="{params.reference_dir}/${{ref_name}}.fasta"
+            fi
+        else
+            ref_fasta="{params.reference_dir}/${{ref_name}}.fasta"
+        fi
+
+        samtools mpileup -B -f "$ref_fasta" -b {input.bam_list} | \
+            java -jar {params.tools_path}/VarScan.v2.3.9.jar mpileup2cns \
+            > {output.cns}
+        """
+
+
+rule check_min_strains:
+    """Check if there are enough strains for cgSNP analysis."""
+    input:
+        name_list="results/cgsnp/name_list.txt",
+    output:
+        flag="results/cgsnp/.enough_strains",
+    params:
+        min_strains=MIN_STRAINS,
+    run:
+        with open(input.name_list) as f:
+            count = sum(1 for line in f if line.startswith(">"))
+        if count >= params.min_strains:
+            with open(output.flag, "w") as f:
+                f.write(f"OK: {count} strains\n")
+        else:
+            raise ValueError(
+                f"Only {count} strains found, need at least "
+                f"{params.min_strains} for cgSNP analysis. "
+                f"Add more samples and re-run."
+            )
+
+
+rule extract_consensus:
+    """Extract core genome consensus sequences from VarScan output."""
+    input:
+        cns="results/cgsnp/mpileup2cns.txt",
+        name_list="results/cgsnp/name_list.txt",
+        flag="results/cgsnp/.enough_strains",
+    output:
+        fasta="results/cgsnp/mpileup2cns_tran.fasta",
+        original="results/cgsnp/mpileup2cns_original.txt",
+    params:
+        script=os.path.join(SCRIPTS_DIR, "extract_consensus.py"),
+        prefix="results/cgsnp/mpileup2cns",
+    shell:
+        """
+        python {params.script} \
+            -i {input.cns} \
+            -n {input.name_list} \
+            -o {params.prefix}
+        """
+
+
+rule extract_snps:
+    """Extract SNP positions from consensus matrix."""
+    input:
+        original="results/cgsnp/mpileup2cns_original.txt",
+        name_list="results/cgsnp/name_list.txt",
+    output:
+        fasta="results/cgsnp/mpileup2cns_nondupli_tran.fasta",
+    params:
+        script=os.path.join(SCRIPTS_DIR, "extract_snps.py"),
+    shell:
+        """
+        python {params.script} \
+            -i {input.original} \
+            -n {input.name_list} \
+            -o {output.fasta}
+        """
+
+
+rule fasta_to_phylip:
+    """Convert FASTA to Phylip format."""
+    input:
+        fasta="results/cgsnp/mpileup2cns_nondupli_tran.fasta",
+    output:
+        phylip="results/cgsnp/mpileup2cns_nondupli_tran.phy",
+    params:
+        tools_path=TOOLS_PATH,
+    shell:
+        """
+        python {params.tools_path}/convert_fasta_to_phylip.py \
+            -i {input.fasta} -o {output.phylip}
+        """
+
+
+rule phyml:
+    """Build starting tree for ClonalFrameML using PhyML."""
+    input:
+        phylip="results/cgsnp/mpileup2cns_nondupli_tran.phy",
+    output:
+        tree="results/cgsnp/mpileup2cns_nondupli_tran.phy_phyml_tree.txt",
+        stats="results/cgsnp/mpileup2cns_nondupli_tran.phy_phyml_stats.txt",
+    params:
+        model=config["phyml"]["model"],
+        bootstrap=config["phyml"]["bootstrap"],
+    shell:
+        """
+        cd results/cgsnp && \
+        phyml -i $(basename {input.phylip}) -m {params.model} -b {params.bootstrap}
+        """
+
+
+rule raxml_pre_cfml:
+    """Build reference tree before ClonalFrameML using RAxML."""
+    input:
+        fasta="results/cgsnp/mpileup2cns_nondupli_tran.fasta",
+    output:
+        tree="results/cgsnp/RAxML_bestTree.mpileup2cns_nondupli_tran_RAxML",
+    params:
+        model=config["raxml"]["model"],
+        threads=config["raxml"]["threads"],
+        seed=config["raxml"]["seed"],
+        bootstrap=config["raxml"]["bootstrap_pre_cfml"],
+    shell:
+        """
+        cd results/cgsnp && \
+        rm -f *RAxML*mpileup2cns_nondupli_tran_RAxML* && \
+        raxmlHPC-PTHREADS -f a \
+            -s $(basename {input.fasta}) \
+            -n mpileup2cns_nondupli_tran_RAxML \
+            -m {params.model} -T {params.threads} \
+            -x {params.seed} -p{params.seed} -# {params.bootstrap}
+        """
+
+
+rule calc_kappa:
+    """Calculate kappa (transition/transversion ratio) from PhyML stats."""
+    input:
+        stats="results/cgsnp/mpileup2cns_nondupli_tran.phy_phyml_stats.txt",
+    output:
+        kappa="results/cgsnp/kappa.txt",
+    params:
+        script=os.path.join(SCRIPTS_DIR, "calc_kappa.py"),
+    shell:
+        """
+        python {params.script} -i {input.stats} -o {output.kappa}
+        """
+
+
+rule clonalframeml:
+    """Detect homologous recombination regions using ClonalFrameML."""
+    input:
+        tree="results/cgsnp/mpileup2cns_nondupli_tran.phy_phyml_tree.txt",
+        fasta="results/cgsnp/mpileup2cns_tran.fasta",
+        kappa="results/cgsnp/kappa.txt",
+    output:
+        importation="results/cgsnp/mpileup2cns_tran.importation_status.txt",
+    shell:
+        r"""
+        kappa=$(cat {input.kappa})
+        cd results/cgsnp && \
+        ClonalFrameML \
+            $(basename {input.tree}) \
+            $(basename {input.fasta}) \
+            mpileup2cns_tran \
+            -kappa $kappa -emsim 100
+        """
+
+
+rule remove_recombination:
+    """Exclude homologous recombination regions from alignment."""
+    input:
+        fasta="results/cgsnp/mpileup2cns_tran.fasta",
+        importation="results/cgsnp/mpileup2cns_tran.importation_status.txt",
+    output:
+        clean_fasta="results/cgsnp/mpileup2cns_tran.recRemoved.fasta",
+    params:
+        tools_path=TOOLS_PATH,
+    shell:
+        """
+        cd results/cgsnp && \
+        python {params.tools_path}/remove_rec_from_ClonalFrameML_output_v1.1.py \
+            -a $(basename {input.fasta}) \
+            -o $(basename {input.importation})
+        """
+
+
+rule post_cfml_snps:
+    """Extract SNPs from recombination-removed alignment."""
+    input:
+        fasta="results/cgsnp/mpileup2cns_tran.recRemoved.fasta",
+    output:
+        snp_fasta="results/cgsnp/mpileup2cns_tran.recRemoved.snp.fasta",
+    params:
+        script=os.path.join(SCRIPTS_DIR, "post_clonalframeml.py"),
+    shell:
+        """
+        python {params.script} -i {input.fasta} -o {output.snp_fasta}
+        """
+
+
+rule raxml_final:
+    """Final molecular phylogenetic analysis using RAxML."""
+    input:
+        fasta="results/cgsnp/mpileup2cns_tran.recRemoved.snp.fasta",
+    output:
+        tree="results/cgsnp/RAxML_bestTree.final_RAxML",
+    params:
+        model=config["raxml"]["model"],
+        threads=config["raxml"]["threads"],
+        seed=config["raxml"]["seed"],
+        bootstrap=config["raxml"]["bootstrap_final"],
+    shell:
+        """
+        cd results/cgsnp && \
+        rm -f *RAxML*final_RAxML* && \
+        raxmlHPC-PTHREADS -f a \
+            -s $(basename {input.fasta}) \
+            -n final_RAxML \
+            -m {params.model} -T {params.threads} \
+            -x {params.seed} -p{params.seed} -# {params.bootstrap}
+        """
+
+
+rule snp_dists:
+    """Calculate pairwise SNP distance matrix."""
+    input:
+        fasta="results/cgsnp/mpileup2cns_tran.recRemoved.snp.fasta",
+    output:
+        dist="results/cgsnp/snp_distance.tsv",
+    shell:
+        """
+        snp-dists {input.fasta} > {output.dist}
+        """
+
+
+# ── Full cgSNP analysis target ───────────────────────────────────────────────
+rule cgsnp_analysis:
+    """Run the full cgSNP analysis pipeline."""
+    input:
+        tree="results/cgsnp/RAxML_bestTree.final_RAxML",
+        dist="results/cgsnp/snp_distance.tsv",
+        pre_tree="results/cgsnp/RAxML_bestTree.mpileup2cns_nondupli_tran_RAxML",

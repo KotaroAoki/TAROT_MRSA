@@ -1,0 +1,57 @@
+# TAROT-MRSA Snakemake Configuration
+# ====================================
+
+# List of sample IDs to analyze.
+# Each sample should have a corresponding directory under sample_dir.
+samples: []
+  # - sample1
+  # - sample2
+
+# Directory containing subdirectories of per-sample FASTQ files
+sample_dir: "seq_data"
+
+# Directory containing S. aureus reference genome FASTA files
+reference_dir: "/tmp/Saureus_reference_strain_genome"
+
+# Directory to store BAM files organized by reference
+bam_dir: "/tmp/Saureus_bam"
+
+# Path to supplementary tools (VarScan, Perl/Python scripts, stringMLST DB, etc.)
+tools_path: "/tmp/program"
+
+# stringMLST database path
+stringmlst_db: "/tmp/program/stringMLST/datasets/Staphylococcus_aureus/Staphylococcus_aureus"
+
+# Genome parameters
+genome_size: 5000000
+coverage: 100
+
+# Minimum number of strains required for cgSNP analysis
+min_strains_for_snp: 4
+
+# Thread count for multi-threaded tools
+threads: 16
+
+# NanoFilt parameters
+nanofilt:
+  quality: 10
+  headcrop: 75
+  min_length: 1000
+
+# wgsim parameters
+wgsim:
+  read_length: 300
+  num_reads: 1000000
+
+# RAxML parameters
+raxml:
+  model: "GTRGAMMA"
+  threads: 4
+  seed: 12345
+  bootstrap_pre_cfml: 100
+  bootstrap_final: 1000
+
+# PhyML parameters
+phyml:
+  model: "GTR"
+  bootstrap: 100

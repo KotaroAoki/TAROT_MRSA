@@ -38,7 +38,10 @@ RUN mamba install -c bioconda dechat -y
 RUN mamba install -c bioconda bbmap -y 
 RUN mamba install -c conda-forge bc -y 
 RUN pip install stringMLST
+RUN mamba install -c bioconda -c conda-forge snakemake -y
 
-
+# Copy workflow files
+COPY ./workflow /tmp/program/workflow
+COPY ./config /tmp/program/config
 
 CMD [ "/bin/bash" ]
