@@ -1,0 +1,26 @@
+name: tarot-mrsa
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - fastqc
+  - fastp
+  - samtools
+  - pigz
+  - nanofilt
+  - nanoplot
+  - bwa
+  - seqkit
+  - wgsim
+  - phyml
+  - raxml
+  - clonalframeml
+  - snp-dists
+  - dechat
+  - bbmap
+  - bc
+  - varscan
+  - biopython
+  - pip:
+    - stringMLST

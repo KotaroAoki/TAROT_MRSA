@@ -3,6 +3,7 @@ TAROT-MRSA: Snakemake workflow for successive cgSNP-based phylogenetic analysis
 of methicillin-resistant Staphylococcus aureus (MRSA).
 
 Converted from TAROT_MRSA_successive_cgSNP_analysis.sh
+Refactored to use Conda environments for reproducibility and lightweight container.
 """
 
 import os
@@ -78,6 +79,7 @@ rule decompress:
         sample_dir=os.path.join(SAMPLE_DIR, "{sample}"),
     output:
         flag=touch("results/{sample}/.decompressed"),
+    conda: "envs/tarot.yaml"
     shell:
         """
         cd {input.sample_dir}
@@ -94,6 +96,7 @@ rule concat_reads:
         flag="results/{sample}/.decompressed",
     output:
         fastq="results/{sample}/cat_reads.fastq",
+    conda: "envs/tarot.yaml"
     shell:
         """
         cat {input.sample_dir}/*.fastq > {output.fastq} 2>/dev/null || \
@@ -111,6 +114,7 @@ rule nanoplot_raw:
     params:
         outdir="results/{sample}/nanoplot_raw",
     threads: THREADS
+    conda: "envs/tarot.yaml"
     shell:
         """
         NanoPlot --fastq {input.fastq} --loglength -o {params.outdir}
@@ -127,6 +131,7 @@ rule nanofilt:
         quality=config["nanofilt"]["quality"],
         headcrop=config["nanofilt"]["headcrop"],
         min_length=config["nanofilt"]["min_length"],
+    conda: "envs/tarot.yaml"
     shell:
         """
         NanoFilt -q {params.quality} --headcrop {params.headcrop} \
@@ -143,6 +148,7 @@ rule nanoplot_trimmed:
     params:
         outdir="results/{sample}/nanoplot_trimmed",
     threads: THREADS
+    conda: "envs/tarot.yaml"
     shell:
         """
         NanoPlot --fastq {input.fastq} --loglength -o {params.outdir}
@@ -159,6 +165,7 @@ rule downsample:
     params:
         genome_size=GENOME_SIZE,
         coverage=COVERAGE,
+    conda: "envs/tarot.yaml"
     shell:
         r"""
         total_bases=$(grep "Total bases" {input.stats} | \
@@ -183,6 +190,7 @@ rule dechat:
     params:
         prefix="results/{sample}/dechat",
     threads: 20
+    conda: "envs/tarot.yaml"
     shell:
         """
         dechat -i {input.fastq} -o {params.prefix} -t {threads}
@@ -199,6 +207,7 @@ rule wgsim:
     params:
         read_length=config["wgsim"]["read_length"],
         num_reads=config["wgsim"]["num_reads"],
+    conda: "envs/tarot.yaml"
     shell:
         """
         wgsim -h -1 {params.read_length} -2 {params.read_length} \
@@ -216,6 +225,7 @@ rule stringmlst:
         mlst="results/{sample}/stringMLST.txt",
     params:
         db=STRINGMLST_DB,
+    conda: "envs/tarot.yaml"
     shell:
         """
         stringMLST.py --predict -P {params.db} \
@@ -238,6 +248,7 @@ rule find_best_reference:
         bestref="results/{sample}/bestref.txt",
     params:
         reference_dir=REFERENCE_DIR,
+    conda: "envs/tarot.yaml"
     shell:
         r"""
         # Parse MLST type
@@ -286,6 +297,7 @@ rule bwa_mapping:
     params:
         reference_dir=REFERENCE_DIR,
     threads: THREADS
+    conda: "envs/tarot.yaml"
     shell:
         r"""
         bestref=$(cut -f1 {input.bestref})
@@ -333,6 +345,7 @@ rule store_bam:
         flag=touch("results/{sample}/.bam_stored"),
     params:
         bam_dir=BAM_DIR,
+    conda: "envs/tarot.yaml"
     shell:
         r"""
         bestref=$(cut -f1 {input.bestref})
@@ -421,7 +434,7 @@ rule mpileup_varscan:
         cns="results/cgsnp/mpileup2cns.txt",
     params:
         reference_dir=REFERENCE_DIR,
-        tools_path=TOOLS_PATH,
+    conda: "envs/tarot.yaml"
     shell:
         r"""
         ref_name=$(cut -f1 {input.ref_info})
@@ -437,8 +450,7 @@ rule mpileup_varscan:
         fi
 
         samtools mpileup -B -f "$ref_fasta" -b {input.bam_list} | \
-            java -jar {params.tools_path}/VarScan.v2.3.9.jar mpileup2cns \
-            > {output.cns}
+            varscan mpileup2cns > {output.cns}
         """
 
 
@@ -476,6 +488,7 @@ rule extract_consensus:
     params:
         script=os.path.join(SCRIPTS_DIR, "extract_consensus.py"),
         prefix="results/cgsnp/mpileup2cns",
+    conda: "envs/tarot.yaml"
     shell:
         """
         python {params.script} \
@@ -494,6 +507,7 @@ rule extract_snps:
         fasta="results/cgsnp/mpileup2cns_nondupli_tran.fasta",
     params:
         script=os.path.join(SCRIPTS_DIR, "extract_snps.py"),
+    conda: "envs/tarot.yaml"
     shell:
         """
         python {params.script} \
@@ -510,10 +524,11 @@ rule fasta_to_phylip:
     output:
         phylip="results/cgsnp/mpileup2cns_nondupli_tran.phy",
     params:
-        tools_path=TOOLS_PATH,
+        script=os.path.join(SCRIPTS_DIR, "fasta_to_phylip.py"),
+    conda: "envs/tarot.yaml"
     shell:
         """
-        python {params.tools_path}/convert_fasta_to_phylip.py \
+        python {params.script} \
             -i {input.fasta} -o {output.phylip}
         """
 
@@ -528,6 +543,7 @@ rule phyml:
     params:
         model=config["phyml"]["model"],
         bootstrap=config["phyml"]["bootstrap"],
+    conda: "envs/tarot.yaml"
     shell:
         """
         cd results/cgsnp && \
@@ -546,6 +562,7 @@ rule raxml_pre_cfml:
         threads=config["raxml"]["threads"],
         seed=config["raxml"]["seed"],
         bootstrap=config["raxml"]["bootstrap_pre_cfml"],
+    conda: "envs/tarot.yaml"
     shell:
         """
         cd results/cgsnp && \
@@ -566,6 +583,7 @@ rule calc_kappa:
         kappa="results/cgsnp/kappa.txt",
     params:
         script=os.path.join(SCRIPTS_DIR, "calc_kappa.py"),
+    conda: "envs/tarot.yaml"
     shell:
         """
         python {params.script} -i {input.stats} -o {output.kappa}
@@ -580,6 +598,7 @@ rule clonalframeml:
         kappa="results/cgsnp/kappa.txt",
     output:
         importation="results/cgsnp/mpileup2cns_tran.importation_status.txt",
+    conda: "envs/tarot.yaml"
     shell:
         r"""
         kappa=$(cat {input.kappa})
@@ -601,6 +620,7 @@ rule remove_recombination:
         clean_fasta="results/cgsnp/mpileup2cns_tran.recRemoved.fasta",
     params:
         tools_path=TOOLS_PATH,
+    conda: "envs/tarot.yaml"
     shell:
         """
         cd results/cgsnp && \
@@ -618,6 +638,7 @@ rule post_cfml_snps:
         snp_fasta="results/cgsnp/mpileup2cns_tran.recRemoved.snp.fasta",
     params:
         script=os.path.join(SCRIPTS_DIR, "post_clonalframeml.py"),
+    conda: "envs/tarot.yaml"
     shell:
         """
         python {params.script} -i {input.fasta} -o {output.snp_fasta}
@@ -635,6 +656,7 @@ rule raxml_final:
         threads=config["raxml"]["threads"],
         seed=config["raxml"]["seed"],
         bootstrap=config["raxml"]["bootstrap_final"],
+    conda: "envs/tarot.yaml"
     shell:
         """
         cd results/cgsnp && \
@@ -653,6 +675,7 @@ rule snp_dists:
         fasta="results/cgsnp/mpileup2cns_tran.recRemoved.snp.fasta",
     output:
         dist="results/cgsnp/snp_distance.tsv",
+    conda: "envs/tarot.yaml"
     shell:
         """
         snp-dists {input.fasta} > {output.dist}
